@@ -1,0 +1,17 @@
+{
+  "name": "openapi-exporter",
+  "private": true,
+  "version": "0.0.1",
+  "scripts": {
+    "build": "yaak plugin build",
+    "dev": "yaak plugin dev"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.14"
+  },
+  "dependencies": {
+    "@yaakapp/api": "^0.8.3"
+  }
+}
