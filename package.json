@@ -1,7 +1,14 @@
 {
-  "name": "openapi-exporter",
-  "private": true,
+  "name": "@azumia-azu/openapi-exporter",
+  "displayName": "Openapi Exporter",
+  "description": "Yaak Plugin for export workspace and folder as openapi JSON",
+  "homepage": "https://github.com/azumia-azu/yaak-openapi-exporter",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com:azumia-azu/yaak-openapi-exporter.git"
+  },
   "version": "0.0.1",
+  "private": true,
   "scripts": {
     "build": "yaak plugin build",
     "dev": "yaak plugin dev"
