@@ -6,11 +6,19 @@ Yaak plugin: export current Workspace or Folder as OpenAPI JSON.
 
 - Export from `Workspace` context menu
 - Export from `Folder` context menu (includes subfolders)
+- Workspace schema management:
+  - `Schema: Upsert`
+  - `Schema: Delete`
+  - `Schema: Copy Registry JSON`
+- Request-level schema operations:
+  - `Schema: Bind to Request Body`
+  - `Schema: Validate Request Body`
 - Resolve URL templates with current environment values before generating path
 - Use latest request response history (if available) to build OpenAPI `responses`
   - status code from latest response
   - content-type from response headers
   - response body example from `bodyPath` (when readable and text-based)
+- Export writes `components.schemas` and `requestBody.$ref` when request-schema binding exists
 - Preserve Chinese file names and sanitize invalid filename characters
 - Save flow supports creating new files (choose directory + input filename)
 
@@ -42,6 +50,15 @@ npm run build
    - Select output directory
    - Input file name (auto appends `.json` if missing)
 4. Plugin writes file and also copies generated JSON to clipboard.
+
+### Manage Schemas
+
+1. Right-click workspace:
+   - `Schema: Upsert` to add/update a JSON schema by name
+   - `Schema: Delete` to remove a schema
+2. Right-click request:
+   - `Schema: Bind to Request Body` to bind one schema
+   - `Schema: Validate Request Body` to validate body against schema
 
 ## Output Notes
 

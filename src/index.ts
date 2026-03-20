@@ -17,6 +17,9 @@ type OpenApiDocument = {
   };
   servers?: Array<{ url: string }>;
   paths: Record<string, Record<string, unknown>>;
+  components?: {
+    schemas?: Record<string, unknown>;
+  };
   tags?: Array<{ name: string }>;
   "x-yaak-export"?: {
     requestCount: number;
@@ -25,6 +28,18 @@ type OpenApiDocument = {
     duplicatePathMethodCount: number;
   };
 };
+
+type WorkspaceSchemaState = {
+  schemas: Record<string, unknown>;
+  bindings: Record<string, string>;
+};
+
+type SchemaRegistry = {
+  version: 1;
+  workspaces: Record<string, WorkspaceSchemaState>;
+};
+
+const SCHEMA_STORE_KEY = "openapi_exporter.schema_registry.v1";
 
 export const plugin: PluginDefinition = {
   workspaceActions: [
@@ -35,6 +50,27 @@ export const plugin: PluginDefinition = {
         await exportOpenApi(ctx, args.workspace, null);
       },
     },
+    {
+      label: "Schema: Upsert",
+      icon: "pin",
+      async onSelect(ctx, args) {
+        await upsertWorkspaceSchema(ctx, args.workspace.id);
+      },
+    },
+    {
+      label: "Schema: Delete",
+      icon: "trash",
+      async onSelect(ctx, args) {
+        await deleteWorkspaceSchema(ctx, args.workspace.id);
+      },
+    },
+    {
+      label: "Schema: Copy Registry JSON",
+      icon: "copy",
+      async onSelect(ctx, args) {
+        await copyWorkspaceSchemas(ctx, args.workspace.id);
+      },
+    },
   ],
   folderActions: [
     {
@@ -42,6 +78,22 @@ export const plugin: PluginDefinition = {
       icon: "copy",
       async onSelect(ctx, args) {
         await exportOpenApi(ctx, null, args.folder);
+      },
+    },
+  ],
+  httpRequestActions: [
+    {
+      label: "Schema: Bind to Request Body",
+      icon: "pin",
+      async onSelect(ctx, args) {
+        await bindSchemaToRequest(ctx, args.httpRequest);
+      },
+    },
+    {
+      label: "Schema: Validate Request Body",
+      icon: "check_circle",
+      async onSelect(ctx, args) {
+        await validateRequestBodyWithSchema(ctx, args.httpRequest);
       },
     },
   ],
@@ -133,6 +185,318 @@ async function promptOutputPath(ctx: Context, defaultFileName: string) {
   return join(directory, fileName);
 }
 
+async function upsertWorkspaceSchema(ctx: Context, workspaceId: string) {
+  const values = await ctx.prompt.form({
+    id: "schema_upsert",
+    title: "Upsert JSON Schema",
+    confirmText: "Save",
+    cancelText: "Cancel",
+    inputs: [
+      {
+        type: "text",
+        name: "schemaName",
+        label: "Schema name",
+        placeholder: "UserCreateRequest",
+      },
+      {
+        type: "editor",
+        name: "schemaJson",
+        label: "Schema JSON",
+        language: "json",
+        defaultValue: "{\n  \"type\": \"object\",\n  \"properties\": {}\n}",
+      },
+    ],
+  });
+
+  if (!values) return;
+  const schemaName = typeof values.schemaName === "string" ? values.schemaName.trim() : "";
+  const schemaJson = typeof values.schemaJson === "string" ? values.schemaJson.trim() : "";
+  if (!schemaName || !schemaJson) {
+    await ctx.toast.show({ color: "warning", message: "Schema name and JSON are required" });
+    return;
+  }
+
+  try {
+    const parsed = JSON.parse(schemaJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      await ctx.toast.show({ color: "warning", message: "Schema must be a JSON object" });
+      return;
+    }
+    const state = await loadWorkspaceSchemaState(ctx, workspaceId);
+    state.schemas[schemaName] = parsed;
+    await saveWorkspaceSchemaState(ctx, workspaceId, state);
+    await ctx.toast.show({ color: "success", message: `Schema '${schemaName}' saved` });
+  } catch (error) {
+    await ctx.toast.show({ color: "danger", message: `Invalid JSON: ${toErrorMessage(error)}` });
+  }
+}
+
+async function deleteWorkspaceSchema(ctx: Context, workspaceId: string) {
+  const state = await loadWorkspaceSchemaState(ctx, workspaceId);
+  const schemaNames = Object.keys(state.schemas).sort();
+  if (schemaNames.length === 0) {
+    await ctx.toast.show({ color: "notice", message: "No schemas to delete" });
+    return;
+  }
+
+  const values = await ctx.prompt.form({
+    id: "schema_delete",
+    title: "Delete JSON Schema",
+    description: `Available: ${schemaNames.join(", ")}`,
+    confirmText: "Delete",
+    cancelText: "Cancel",
+    inputs: [
+      {
+        type: "select",
+        name: "schemaName",
+        label: "Schema",
+        options: schemaNames.map((name) => ({ label: name, value: name })),
+      },
+    ],
+  });
+  if (!values) return;
+  const schemaName = typeof values.schemaName === "string" ? values.schemaName : "";
+  if (!schemaName || !state.schemas[schemaName]) return;
+
+  delete state.schemas[schemaName];
+  for (const [requestId, boundSchema] of Object.entries(state.bindings)) {
+    if (boundSchema === schemaName) delete state.bindings[requestId];
+  }
+  await saveWorkspaceSchemaState(ctx, workspaceId, state);
+  await ctx.toast.show({ color: "success", message: `Schema '${schemaName}' deleted` });
+}
+
+async function copyWorkspaceSchemas(ctx: Context, workspaceId: string) {
+  const state = await loadWorkspaceSchemaState(ctx, workspaceId);
+  const payload = JSON.stringify(
+    {
+      schemas: state.schemas,
+      bindings: state.bindings,
+    },
+    null,
+    2
+  );
+  await ctx.clipboard.copyText(payload);
+  await ctx.toast.show({
+    color: "success",
+    message: `Copied ${Object.keys(state.schemas).length} schema(s) to clipboard`,
+  });
+}
+
+async function bindSchemaToRequest(ctx: Context, req: HttpRequest) {
+  const state = await loadWorkspaceSchemaState(ctx, req.workspaceId);
+  const schemaNames = Object.keys(state.schemas).sort();
+  if (schemaNames.length === 0) {
+    await ctx.toast.show({
+      color: "notice",
+      message: "No schemas found. Add schemas from Workspace > Schema: Upsert",
+    });
+    return;
+  }
+
+  const values = await ctx.prompt.form({
+    id: "schema_bind_request",
+    title: "Bind Schema to Request Body",
+    description: `Request: ${req.name || req.id}`,
+    confirmText: "Bind",
+    cancelText: "Cancel",
+    inputs: [
+      {
+        type: "select",
+        name: "schemaName",
+        label: "Schema",
+        options: schemaNames.map((name) => ({ label: name, value: name })),
+        defaultValue: state.bindings[req.id],
+      },
+    ],
+  });
+
+  if (!values) return;
+  const schemaName = typeof values.schemaName === "string" ? values.schemaName : "";
+  if (!schemaName || !state.schemas[schemaName]) return;
+
+  state.bindings[req.id] = schemaName;
+  await saveWorkspaceSchemaState(ctx, req.workspaceId, state);
+  await ctx.toast.show({
+    color: "success",
+    message: `Bound '${schemaName}' to request '${req.name || req.id}'`,
+  });
+}
+
+async function validateRequestBodyWithSchema(ctx: Context, req: HttpRequest) {
+  const state = await loadWorkspaceSchemaState(ctx, req.workspaceId);
+  const schemaNames = Object.keys(state.schemas).sort();
+  if (schemaNames.length === 0) {
+    await ctx.toast.show({
+      color: "notice",
+      message: "No schemas found. Add schemas from Workspace > Schema: Upsert",
+    });
+    return;
+  }
+
+  const values = await ctx.prompt.form({
+    id: "schema_validate_request",
+    title: "Validate Request Body",
+    description: `Request: ${req.name || req.id}`,
+    confirmText: "Validate",
+    cancelText: "Cancel",
+    inputs: [
+      {
+        type: "select",
+        name: "schemaName",
+        label: "Schema",
+        options: schemaNames.map((name) => ({ label: name, value: name })),
+        defaultValue: state.bindings[req.id],
+      },
+    ],
+  });
+  if (!values) return;
+  const schemaName = typeof values.schemaName === "string" ? values.schemaName : "";
+  const schema = state.schemas[schemaName];
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+    await ctx.toast.show({ color: "danger", message: "Selected schema is invalid" });
+    return;
+  }
+
+  const bodyData = extractRequestBodyData(req);
+  const errors = validateJsonSchemaLike(schema as Record<string, unknown>, bodyData, "$");
+  if (errors.length === 0) {
+    await ctx.toast.show({
+      color: "success",
+      message: `Validation passed with schema '${schemaName}'`,
+    });
+    return;
+  }
+
+  await ctx.toast.show({
+    color: "danger",
+    message: `Validation failed (${errors.length}): ${errors.slice(0, 2).join(" | ")}`,
+  });
+}
+
+async function loadWorkspaceSchemaState(ctx: Context, workspaceId: string) {
+  const registry = await loadSchemaRegistry(ctx);
+  return registry.workspaces[workspaceId] ?? { schemas: {}, bindings: {} };
+}
+
+async function saveWorkspaceSchemaState(
+  ctx: Context,
+  workspaceId: string,
+  state: WorkspaceSchemaState
+) {
+  const registry = await loadSchemaRegistry(ctx);
+  registry.workspaces[workspaceId] = state;
+  await ctx.store.set(SCHEMA_STORE_KEY, registry);
+}
+
+async function loadSchemaRegistry(ctx: Context): Promise<SchemaRegistry> {
+  const saved = await ctx.store.get<SchemaRegistry>(SCHEMA_STORE_KEY);
+  if (!saved || saved.version !== 1 || typeof saved.workspaces !== "object") {
+    return { version: 1, workspaces: {} };
+  }
+  return saved;
+}
+
+function extractRequestBodyData(req: HttpRequest) {
+  const candidate = pickBodyExample(req.body);
+  if (typeof candidate === "string") {
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return candidate;
+    }
+  }
+  return candidate;
+}
+
+function validateJsonSchemaLike(
+  schema: Record<string, unknown>,
+  value: unknown,
+  path: string
+): string[] {
+  const errors: string[] = [];
+
+  const expectedType = typeof schema.type === "string" ? schema.type : undefined;
+  if (expectedType && !matchesType(value, expectedType)) {
+    errors.push(`${path}: expected ${expectedType}`);
+    return errors;
+  }
+
+  const enumValues = Array.isArray(schema.enum) ? schema.enum : null;
+  if (enumValues && !enumValues.some((v) => deepEqual(v, value))) {
+    errors.push(`${path}: value not in enum`);
+  }
+
+  if (expectedType === "object" && value && typeof value === "object" && !Array.isArray(value)) {
+    const obj = value as Record<string, unknown>;
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    for (const key of required) {
+      if (typeof key === "string" && !(key in obj)) errors.push(`${path}.${key}: required`);
+    }
+
+    const properties =
+      schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+        ? (schema.properties as Record<string, unknown>)
+        : {};
+    for (const [key, childSchema] of Object.entries(properties)) {
+      if (!(key in obj)) continue;
+      if (!childSchema || typeof childSchema !== "object" || Array.isArray(childSchema)) continue;
+      errors.push(
+        ...validateJsonSchemaLike(
+          childSchema as Record<string, unknown>,
+          obj[key],
+          `${path}.${key}`
+        )
+      );
+    }
+
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(obj)) {
+        if (!(key in properties)) errors.push(`${path}.${key}: additional property not allowed`);
+      }
+    }
+  }
+
+  if (expectedType === "array" && Array.isArray(value)) {
+    const itemSchema =
+      schema.items && typeof schema.items === "object" && !Array.isArray(schema.items)
+        ? (schema.items as Record<string, unknown>)
+        : null;
+    if (itemSchema) {
+      value.forEach((item, index) => {
+        errors.push(...validateJsonSchemaLike(itemSchema, item, `${path}[${index}]`));
+      });
+    }
+  }
+
+  return errors;
+}
+
+function matchesType(value: unknown, type: string) {
+  switch (type) {
+    case "object":
+      return value !== null && typeof value === "object" && !Array.isArray(value);
+    case "array":
+      return Array.isArray(value);
+    case "string":
+      return typeof value === "string";
+    case "number":
+      return typeof value === "number";
+    case "integer":
+      return typeof value === "number" && Number.isInteger(value);
+    case "boolean":
+      return typeof value === "boolean";
+    case "null":
+      return value === null;
+    default:
+      return true;
+  }
+}
+
+function deepEqual(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 async function resolveWorkspaceById(
   ctx: Context,
   workspaceId: string
@@ -217,7 +581,7 @@ function buildFolderPathMap(folders: Folder[]) {
 async function toOpenApi(
   ctx: Context,
   requests: HttpRequest[],
-  workspace: Pick<Workspace, "name">,
+  workspace: Pick<Workspace, "id" | "name">,
   folderPathById: Map<string, string>
 ): Promise<OpenApiDocument> {
   const paths: OpenApiDocument["paths"] = {};
@@ -225,6 +589,8 @@ async function toOpenApi(
   const servers = new Set<string>();
   let duplicatePathMethodCount = 0;
   let responseBackedOperationCount = 0;
+  const schemaState = await loadWorkspaceSchemaState(ctx, workspace.id);
+  const componentSchemas = { ...schemaState.schemas };
 
   for (const req of requests) {
     const method = req.method.toLowerCase();
@@ -258,7 +624,10 @@ async function toOpenApi(
       tags.add(tag);
     }
 
-    const requestBody = buildRequestBody(req);
+    const boundSchemaName = schemaState.bindings[req.id];
+    const requestBody = buildRequestBody(req, boundSchemaName && componentSchemas[boundSchemaName]
+      ? boundSchemaName
+      : undefined);
     if (requestBody) operation.requestBody = requestBody;
 
     pathItem[method] = operation;
@@ -272,6 +641,12 @@ async function toOpenApi(
     },
     servers: Array.from(servers).map((url) => ({ url })),
     paths,
+    components:
+      Object.keys(componentSchemas).length > 0
+        ? {
+            schemas: componentSchemas,
+          }
+        : undefined,
     tags: Array.from(tags).sort().map((name) => ({ name })),
     "x-yaak-export": {
       requestCount: requests.length,
@@ -435,7 +810,7 @@ function buildParameters(req: HttpRequest, path: string) {
   return params;
 }
 
-function buildRequestBody(req: HttpRequest) {
+function buildRequestBody(req: HttpRequest, schemaRefName?: string) {
   if (["get", "delete", "head", "options"].includes(req.method.toLowerCase())) {
     return undefined;
   }
@@ -446,8 +821,9 @@ function buildRequestBody(req: HttpRequest) {
     required: false,
     content: {
       [contentType]: {
-        schema:
-          contentType === "application/json"
+        schema: schemaRefName
+          ? { $ref: `#/components/schemas/${escapeJsonPointerToken(schemaRefName)}` }
+          : contentType === "application/json"
             ? { type: "object" }
             : { type: "string" },
         example,
@@ -545,6 +921,10 @@ function sanitizeFileName(name: string) {
     .replace(/^-+|-+$/g, "");
 
   return sanitized || "openapi";
+}
+
+function escapeJsonPointerToken(value: string) {
+  return value.replace(/~/g, "~0").replace(/\//g, "~1");
 }
 
 function isHttpMethod(method: string): method is
